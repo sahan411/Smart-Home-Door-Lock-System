@@ -1,0 +1,2243 @@
+#define BLYNK_TEMPLATE_ID "TMPL6xLJu3Zd9"
+#define BLYNK_TEMPLATE_NAME "Quickstart Template"
+#define BLYNK_AUTH_TOKEN "ai6VJbiYixZUAW_CqKB6wVaCUvXrBE4b"
+
+#include <SPI.h>
+#include <MFRC522.h>
+#include <time.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <Keypad.h>
+#include <Adafruit_Fingerprint.h>
+#include <Arduino.h>
+#include <WiFi.h>
+#include <BlynkSimpleEsp32.h>
+#include <EEPROM.h>
+
+#define EEPROM_SIZE 512
+#define EEPROM_CARD_COUNT_ADDR 0
+#define EEPROM_CARDS_START_ADDR 4
+#define MAX_CARDS 20  // Maximum number of cards to store
+#define CARD_ID_LENGTH 16  // Maximum length for each card ID
+
+// Add these declarations at the appropriate place in your global variables section
+bool rfidSensorAvailable = false;
+String lastRFIDRead = "";
+
+// Add these global variables for PIN management
+String newPIN = "";
+String confirmPIN = "";
+bool enteringNewPIN = true; // true: entering new PIN, false: confirming PIN
+
+// Time server settings
+const char* ntpServer = "pool.ntp.org";
+const long  gmtOffset_sec = 0;      // Change this to your timezone offset in seconds
+const int   daylightOffset_sec = 3600; // Change this for Daylight Saving Time if applicable
+
+// Define event codes for notifications
+#define EVENT_ACCESS_DENIED "access_denied"
+#define EVENT_PIN_CHANGED "pin_changed"
+#define EVENT_FINGER_DELETED "finger_deleted"
+#define EVENT_SECURITY_ALERT "security_alert"
+
+// WiFi credentials
+char ssid[] = "Pixel 7";     // Your WiFi network name
+char pass[] = "12345123456";  // Your WiFi password
+
+// Blynk authentication token
+char auth[] = "ai6VJbiYixZUAW_CqKB6wVaCUvXrBE4b"; // Token from Blynk app
+
+// Define virtual pins for Blynk app
+#define VPIN_DOOR_STATUS V6    // Door status (locked/unlocked)
+#define VPIN_REMOTE_UNLOCK V1  // Remote unlock button
+#define VPIN_ACCESS_LOG V3    // Access logs
+#define VPIN_ALARM_NOTIFY V5   // Alarm notifications
+#define VPIN_RESET_ALARM V8  // Choose an available virtual pin
+#define VPIN_CHANGE_PIN V4     // Change PIN
+#define VPIN_USER_MANAGEMENT V5 // User management
+#define VPIN_UNLOCK_TIMER V7
+
+// Buzzer Definition
+#define BUZZER_PIN 12  // Connect buzzer to GPIO12
+
+// OLED Display Definitions
+#define SCREEN_WIDTH 128   // OLED width in pixels
+#define SCREEN_HEIGHT 64   // OLED height in pixels
+#define OLED_RESET    -1   // Reset pin (set to -1 if not used)
+#define OLED_ADDRESS  0x3C // I2C address for OLED display
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+// RC522 RFID Module pins - avoiding conflicts
+#define RFID_SS_PIN  5  // ESP32 pin for SDA (SS)
+#define RFID_RST_PIN 15  // ESP32 pin for RST
+
+// Define MFRC522 instance
+MFRC522 rfid(RFID_SS_PIN, RFID_RST_PIN);
+
+String* authorizedCards = NULL;  // Will be initialized dynamically
+int numAuthorizedCards = 0;
+
+// Keypad Definitions
+const byte ROWS = 4;      // number of rows in keypad
+const byte COLS = 4;      // number of columns in keypad
+char keys[ROWS][COLS] = {
+  {'1', '2', '3', 'A'},
+  {'4', '5', '6', 'B'},
+  {'7', '8', '9', 'C'},
+  {'*', '0', '#', 'D'}
+};
+byte rowPins[ROWS] = {26, 25, 33, 32}; // Previous column pins
+byte colPins[COLS] = {27, 14, 4, 2};   // Previous row pins
+Keypad keypad = Keypad(makeKeymap(keys), rowPins, colPins, ROWS, COLS);
+
+// Relay Definition
+#define RELAY_PIN 13  // Connect relay module control pin to GPIO5
+
+// Fingerprint Sensor Definitions
+#define FINGERPRINT_RX 16  // ESP32 RX (Connect to Fingerprint TX)
+#define FINGERPRINT_TX 17  // ESP32 TX (Connect to Fingerprint RX)
+HardwareSerial fingerSerial(1); // Use Serial1 for fingerprint sensor
+Adafruit_Fingerprint finger = Adafruit_Fingerprint(&fingerSerial);
+
+// System State and Variables
+enum SystemState {
+  STATE_LOCKED,
+  STATE_UNLOCKED,
+  STATE_ENROLLING,
+  STATE_LEARNING_CARD,
+  STATE_PIN_MANAGEMENT
+};
+
+SystemState currentState = STATE_LOCKED;
+String correctPIN = "1234";
+String enteredPIN = "";
+bool fingerprintSensorAvailable = false;
+unsigned long doorUnlockTime = 0;
+const unsigned long DOOR_UNLOCK_DURATION = 30000; // 30 seconds unlock time
+
+// DISPLAY FUNCTIONS
+// DISPLAY FUNCTIONS - Enhanced
+// DISPLAY FUNCTIONS - Enhanced
+void displayMessage(String message, bool showBorder = false) {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+
+  if (showBorder) {
+    // Draw a border around the display
+    display.drawRect(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT, SSD1306_WHITE);
+    display.setCursor(3, 3);
+  } else {
+    display.setCursor(0, 0);
+  }
+
+  display.println(message);
+  display.display();
+}
+
+// Add a centered text function
+void displayCenteredText(String message, int yPosition = 16) {
+  int16_t x1, y1;
+  uint16_t w, h;
+
+  display.setTextSize(1);
+  display.getTextBounds(message, 0, 0, &x1, &y1, &w, &h);
+
+  // Calculate center position
+  int x = (SCREEN_WIDTH - w) / 2;
+
+  display.setCursor(x, yPosition);
+  display.println(message);
+}
+
+// Function to initialize NTP
+void initNTP() {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("Cannot sync time: WiFi not connected");
+    displayMessage("Time sync skipped\nNo WiFi connection");
+    delay(1000);
+    return;
+  }
+
+  Serial.println("Configuring NTP...");
+  configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+
+  Serial.println("Waiting for NTP time sync...");
+  displayMessage("Syncing time...");
+
+  time_t now = time(nullptr);
+  int retries = 0;
+  while (now < 24 * 3600 && retries < 10) {
+    delay(500);
+    Serial.print(".");
+    now = time(nullptr);
+    retries++;
+  }
+
+  if (now > 24 * 3600) {
+    Serial.println("\nTime synchronized!");
+    displayMessage("Time synchronized!");
+
+    // Print current time
+    struct tm timeinfo;
+    if (getLocalTime(&timeinfo)) {
+      char timeStr[50];
+      strftime(timeStr, sizeof(timeStr), "%A, %B %d %Y %H:%M:%S", &timeinfo);
+      Serial.println(timeStr);
+    }
+  } else {
+    Serial.println("\nFailed to sync time, using approximate time");
+    displayMessage("Time sync failed\nUsing approx. time");
+  }
+
+  delay(1000);
+}
+
+// Enhanced main screen with battery and icons
+void showMainScreen() {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+
+  // Draw header with system name and divider
+  display.setCursor(0, 0);
+  display.println("Smart Door Lock");
+  display.drawLine(0, 10, SCREEN_WIDTH, 10, SSD1306_WHITE);
+
+  // Draw system status
+  display.setCursor(0, 14);
+
+  if (currentState == STATE_LOCKED) {
+    // Draw lock icon
+    display.drawRect(110, 0, 18, 8, SSD1306_WHITE);
+    display.fillRect(114, 0, 10, 3, SSD1306_WHITE);
+
+    display.println("Status: LOCKED");
+    display.println("\nEnter PIN, scan");
+    display.println("fingerprint or RFID");
+
+    // Draw keypad hint at bottom
+    display.drawLine(0, 53, SCREEN_WIDTH, 53, SSD1306_WHITE);
+    display.setCursor(0, 55);
+    display.print("* Clear      # Submit");
+  }
+  else if (currentState == STATE_UNLOCKED) {
+    // Draw unlock icon
+    display.drawRect(110, 0, 18, 8, SSD1306_WHITE);
+    display.drawLine(114, 3, 124, 3, SSD1306_WHITE);
+
+    // Status and menu items with precise vertical positioning
+    display.setCursor(0, 14);
+    display.print("Status: UNLOCKED");
+
+    display.setCursor(0, 24);
+    display.print("A: Change PIN");
+    display.setCursor(0, 32);
+    display.print("B: Enroll Finger");
+    display.setCursor(0, 40);
+    display.print("C: Learn New Card");
+    display.setCursor(0, 48);
+    display.print("D: Lock Door Now");
+
+    // Calculate remaining time
+    unsigned long elapsedTime = millis() - doorUnlockTime;
+    int remainingTime = (elapsedTime < DOOR_UNLOCK_DURATION) ?
+                        ((DOOR_UNLOCK_DURATION - elapsedTime) / 1000) : 0;
+
+    // Countdown at the very bottom
+    display.setCursor(0, 57);
+    display.print("Auto-lock: ");
+    display.print(remainingTime);
+    display.print("s");
+
+    // Thin progress bar at bottom
+    display.drawLine(0, 56, SCREEN_WIDTH, 56, SSD1306_WHITE);
+    int maxBarWidth = SCREEN_WIDTH;
+    int barWidth = map(remainingTime, 0, DOOR_UNLOCK_DURATION / 1000, 0, maxBarWidth);
+    barWidth = constrain(barWidth, 0, maxBarWidth);
+    display.fillRect(0, 56, barWidth, 1, SSD1306_WHITE);
+  }
+  else if (currentState == STATE_ENROLLING) {
+    // Draw fingerprint icon
+    display.drawCircle(116, 4, 4, SSD1306_WHITE);
+    display.drawLine(116, 4, 116, 7, SSD1306_WHITE);
+
+    display.println("ENROLLMENT MODE");
+    display.println("\nFollow instructions");
+    display.println("on screen");
+    display.println("\n* Cancel enrollment");
+  }
+  else if (currentState == STATE_LEARNING_CARD) {
+    // Draw card icon
+    display.drawRect(108, 1, 20, 8, SSD1306_WHITE);
+    display.drawLine(108, 5, 128, 5, SSD1306_WHITE);
+
+    display.println("CARD LEARNING MODE");
+    display.println("\nPlace card on reader");
+    display.println("\n* Cancel");
+  }
+
+  display.display();
+}
+// Enhanced PIN entry screen
+void showPINEntry() {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+
+  // Header
+  display.setCursor(0, 0);
+  display.println("PIN Entry");
+  display.drawLine(0, 10, SCREEN_WIDTH, 10, SSD1306_WHITE);
+
+  // Draw PIN entry box
+  display.drawRect(25, 20, 80, 15, SSD1306_WHITE);
+  display.setCursor(30, 24);
+
+  // Show masked PIN
+  for (unsigned int i = 0; i < enteredPIN.length(); i++) {
+    display.print("*");
+    display.print(" ");
+  }
+
+  // Draw keypad hint at bottom
+  display.drawLine(0, 53, SCREEN_WIDTH, 53, SSD1306_WHITE);
+  display.setCursor(0, 55);
+  display.print("* Clear      # Submit");
+
+  display.display();
+}
+
+// Enhanced error display
+void showError(String error) {
+  display.clearDisplay();
+
+  // Draw error icon (X)
+  display.drawLine(5, 5, 15, 15, SSD1306_WHITE);
+  display.drawLine(15, 5, 5, 15, SSD1306_WHITE);
+
+  // Draw header
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(25, 5);
+  display.println("ERROR");
+  display.drawLine(0, 18, SCREEN_WIDTH, 18, SSD1306_WHITE);
+
+  // Draw error message
+  display.setCursor(5, 25);
+  display.println(error);
+
+  display.display();
+  errorBeep();
+  delay(2000);
+  showMainScreen();
+}
+
+// Processing animation
+void showProcessing(String operation, int duration = 2000) {
+  unsigned long startTime = millis();
+  const char spinner[] = {'|', '/', '-', '\\'};
+  int spinnerPos = 0;
+
+  while (millis() - startTime < duration) {
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setTextColor(SSD1306_WHITE);
+
+    // Header
+    display.setCursor(0, 0);
+    display.println("Processing...");
+    display.drawLine(0, 10, SCREEN_WIDTH, 10, SSD1306_WHITE);
+
+    // Operation text
+    displayCenteredText(operation, 25);
+
+    // Spinner animation
+    display.setCursor(64, 40);
+    display.print(spinner[spinnerPos]);
+    spinnerPos = (spinnerPos + 1) % 4;
+
+    display.display();
+    delay(120);
+  }
+}
+
+// Progress bar animation
+void showProgress(String operation, int duration = 2000) {
+  unsigned long startTime = millis();
+
+  while (millis() - startTime < duration) {
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setTextColor(SSD1306_WHITE);
+
+    // Header
+    display.setCursor(0, 0);
+    display.println(operation);
+    display.drawLine(0, 10, SCREEN_WIDTH, 10, SSD1306_WHITE);
+
+    // Progress bar
+    int progress = map(millis() - startTime, 0, duration, 0, SCREEN_WIDTH - 20);
+    display.drawRect(10, 30, SCREEN_WIDTH - 20, 10, SSD1306_WHITE);
+    display.fillRect(10, 30, progress, 10, SSD1306_WHITE);
+
+    // Percentage
+    int percent = map(millis() - startTime, 0, duration, 0, 100);
+    display.setCursor(58, 45);
+    display.print(percent);
+    display.print("%");
+
+    display.display();
+    delay(50);
+  }
+}
+
+void initializeCardStorage() {
+  // Initialize EEPROM
+  EEPROM.begin(EEPROM_SIZE);
+
+  // Load authorized cards from EEPROM
+  loadAuthorizedCards();
+}
+
+void loadAuthorizedCards() {
+  // Read the number of cards from EEPROM
+  EEPROM.get(EEPROM_CARD_COUNT_ADDR, numAuthorizedCards);
+
+  // Validate the number (in case of fresh EEPROM)
+  if (numAuthorizedCards > MAX_CARDS || numAuthorizedCards < 0) {
+    numAuthorizedCards = 0;  // Reset if invalid
+    EEPROM.put(EEPROM_CARD_COUNT_ADDR, numAuthorizedCards);
+    EEPROM.commit();
+  }
+
+  // Allocate dynamic memory for the authorized cards
+  if (authorizedCards) {
+    delete[] authorizedCards;  // Free previous memory if exists
+  }
+
+  authorizedCards = new String[MAX_CARDS];  // Allocate memory for maximum cards
+
+  // Read each card ID from EEPROM
+  for (int i = 0; i < numAuthorizedCards; i++) {
+    char cardBuffer[CARD_ID_LENGTH + 1];  // +1 for null terminator
+    int address = EEPROM_CARDS_START_ADDR + (i * CARD_ID_LENGTH);
+
+    // Read the card ID character by character
+    for (int j = 0; j < CARD_ID_LENGTH; j++) {
+      cardBuffer[j] = EEPROM.read(address + j);
+    }
+    cardBuffer[CARD_ID_LENGTH] = '\0';  // Null terminate
+
+    // Convert to String and store
+    authorizedCards[i] = String(cardBuffer);
+  }
+
+  Serial.print("Loaded ");
+  Serial.print(numAuthorizedCards);
+  Serial.println(" authorized cards from EEPROM");
+}
+
+void saveNewCard(String cardID) {
+  // Check if we've reached maximum cards
+  if (numAuthorizedCards >= MAX_CARDS) {
+    Serial.println("ERROR: Maximum number of cards reached!");
+    return;
+  }
+
+  // Store in memory array
+  authorizedCards[numAuthorizedCards] = cardID;
+
+  // Store in EEPROM
+  int address = EEPROM_CARDS_START_ADDR + (numAuthorizedCards * CARD_ID_LENGTH);
+
+  // Write the card ID character by character
+  for (int i = 0; i < cardID.length() && i < CARD_ID_LENGTH; i++) {
+    EEPROM.write(address + i, cardID.charAt(i));
+  }
+
+  // If card ID is shorter than CARD_ID_LENGTH, pad with nulls
+  for (int i = cardID.length(); i < CARD_ID_LENGTH; i++) {
+    EEPROM.write(address + i, '\0');
+  }
+
+  // Increment card count
+  numAuthorizedCards++;
+  EEPROM.put(EEPROM_CARD_COUNT_ADDR, numAuthorizedCards);
+
+  // Commit changes
+  EEPROM.commit();
+
+  Serial.print("Saved new card: ");
+  Serial.println(cardID);
+}
+
+bool removeCard(String cardID) {
+  // Find the card to remove
+  int indexToRemove = -1;
+  for (int i = 0; i < numAuthorizedCards; i++) {
+    if (cardID == authorizedCards[i]) {
+      indexToRemove = i;
+      break;
+    }
+  }
+
+  if (indexToRemove == -1) {
+    return false;  // Card not found
+  }
+
+  // Shift all cards after the removed one
+  for (int i = indexToRemove; i < numAuthorizedCards - 1; i++) {
+    authorizedCards[i] = authorizedCards[i + 1];
+
+    // Update EEPROM
+    int address = EEPROM_CARDS_START_ADDR + (i * CARD_ID_LENGTH);
+    String nextCardID = authorizedCards[i];
+
+    // Write card ID to EEPROM
+    for (int j = 0; j < nextCardID.length() && j < CARD_ID_LENGTH; j++) {
+      EEPROM.write(address + j, nextCardID.charAt(j));
+    }
+    for (int j = nextCardID.length(); j < CARD_ID_LENGTH; j++) {
+      EEPROM.write(address + j, '\0');
+    }
+  }
+
+  // Decrement card count
+  numAuthorizedCards--;
+  EEPROM.put(EEPROM_CARD_COUNT_ADDR, numAuthorizedCards);
+  EEPROM.commit();
+
+  return true;
+}
+
+// BUZZER FUNCTIONS - Improved
+void shortBeep(int freq = 2000, int duration = 80) {
+  // Softer, shorter beep
+  tone(BUZZER_PIN, freq, duration);
+  delay(duration);
+  noTone(BUZZER_PIN);
+}
+
+void doubleBeep() {
+  // More pleasant double beep
+  tone(BUZZER_PIN, 1800, 50);
+  delay(70);
+  tone(BUZZER_PIN, 2200, 50);
+  delay(50);
+  noTone(BUZZER_PIN);
+}
+
+void successBeep() {
+  // More melodic success sound (ascending)
+  tone(BUZZER_PIN, 1300, 80);
+  delay(100);
+  tone(BUZZER_PIN, 1600, 80);
+  delay(100);
+  tone(BUZZER_PIN, 2000, 160);
+  delay(160);
+  noTone(BUZZER_PIN);
+}
+
+void errorBeep() {
+  // Less harsh error sound (descending)
+  tone(BUZZER_PIN, 1800, 100);
+  delay(120);
+  tone(BUZZER_PIN, 1200, 200);
+  delay(200);
+  noTone(BUZZER_PIN);
+}
+
+void warningBeep() {
+  // New function for warnings
+  tone(BUZZER_PIN, 1500, 80);
+  delay(100);
+  tone(BUZZER_PIN, 1500, 80);
+  delay(100);
+  tone(BUZZER_PIN, 1500, 80);
+  delay(80);
+  noTone(BUZZER_PIN);
+}
+
+void alarmBeep(int duration) {
+  // More effective alarm sound
+  unsigned long startTime = millis();
+  while (millis() - startTime < duration) {
+    tone(BUZZER_PIN, 2200);
+    delay(80);
+    tone(BUZZER_PIN, 1800);
+    delay(80);
+  }
+  noTone(BUZZER_PIN);
+}
+
+// Update this function for consistent RFID handling
+void initializeRFID() {
+  SPI.begin();
+  rfid.PCD_Init();
+
+  if (rfid.PCD_PerformSelfTest()) {
+    Serial.println("RFID RC522 reader detected!");
+    rfidSensorAvailable = true;
+    displayMessage("RFID reader\ndetected");
+  } else {
+    Serial.println("RFID reader not found");
+    rfidSensorAvailable = false;
+    displayMessage("No RFID reader\nPIN/Fingerprint only");
+  }
+  delay(1500);
+}
+
+String readRFIDCard() {
+  if (!rfidSensorAvailable) return "";
+
+  String cardID = "";
+
+  // Extra debug for RFID issues
+  if (rfid.PCD_ReadRegister(rfid.VersionReg) == 0) {
+    Serial.println("Warning: RFID reader may have disconnected");
+    rfid.PCD_Init(RFID_SS_PIN, RFID_RST_PIN);
+    delay(50);
+  }
+
+  // Check if card is present
+  if (!rfid.PICC_IsNewCardPresent()) {
+    return ""; // No card present
+  }
+
+  // Try reading twice in case of poor connection
+  if (!rfid.PICC_ReadCardSerial()) {
+    delay(20);
+    if (!rfid.PICC_ReadCardSerial()) {
+      return ""; // Failed to read card
+    }
+  }
+
+  Serial.print("Card UID: ");
+
+  // Format card UID as a hex string (consistent with your current code)
+  for (byte i = 0; i < rfid.uid.size; i++) {
+    // Add leading zero for single-digit hex values
+    if (rfid.uid.uidByte[i] < 0x10) {
+      cardID += "0";
+    }
+    cardID += String(rfid.uid.uidByte[i], HEX);
+
+    // Print each byte with a space
+    Serial.print(rfid.uid.uidByte[i] < 0x10 ? " 0" : " ");
+    Serial.print(rfid.uid.uidByte[i], HEX);
+  }
+  Serial.println();
+
+  // Get card type
+  MFRC522::PICC_Type piccType = rfid.PICC_GetType(rfid.uid.sak);
+  Serial.print("PICC type: ");
+  Serial.println(rfid.PICC_GetTypeName(piccType));
+
+  // Convert cardID to uppercase for consistency with your existing code
+  cardID.toUpperCase();
+
+  // Stop crypto
+  rfid.PICC_HaltA();
+  rfid.PCD_StopCrypto1();
+
+  return cardID;
+}
+
+void updateBlynk() {
+  // Run Blynk processes (necessary to maintain connection)
+  Blynk.run();
+
+  // Update door status on app (if it changed)
+  static SystemState previousState = currentState;
+  if (previousState != currentState) {
+    // Create a detailed status message
+    String statusMsg;
+    if (currentState == STATE_UNLOCKED) {
+      unsigned long elapsedTime = millis() - doorUnlockTime;
+      int remainingTime = (elapsedTime < DOOR_UNLOCK_DURATION) ?
+                          ((DOOR_UNLOCK_DURATION - elapsedTime) / 1000) : 0;
+
+      Blynk.virtualWrite(VPIN_UNLOCK_TIMER, remainingTime);
+      statusMsg = "UNLOCKED";
+    } else if (currentState == STATE_LOCKED) {
+      statusMsg = "LOCKED";
+    } else if (currentState == STATE_ENROLLING) {
+      statusMsg = "ENROLLING";
+    } else if (currentState == STATE_LEARNING_CARD) {
+      statusMsg = "LEARNING CARD";
+    }
+
+    // Send status to Value Display widget
+    Blynk.virtualWrite(VPIN_DOOR_STATUS, statusMsg);
+    Serial.println("Updating Blynk status: " + statusMsg);
+    previousState = currentState;
+  }
+
+  // Periodically update door status (every 5 seconds) to ensure sync
+  static unsigned long lastStatusUpdate = 0;
+  if (millis() - lastStatusUpdate > 5000) {
+    String statusMsg = (currentState == STATE_UNLOCKED) ? "UNLOCKED" :
+                       (currentState == STATE_LOCKED) ? "LOCKED" :
+                       (currentState == STATE_ENROLLING) ? "ENROLLING" : "LEARNING CARD";
+
+    Blynk.virtualWrite(VPIN_DOOR_STATUS, statusMsg);
+
+    // Also update timer if door is unlocked
+    if (currentState == STATE_UNLOCKED) {
+      unsigned long elapsedTime = millis() - doorUnlockTime;
+      int remainingTime = (elapsedTime < DOOR_UNLOCK_DURATION) ?
+                          ((DOOR_UNLOCK_DURATION - elapsedTime) / 1000) : 0;
+
+      Blynk.virtualWrite(VPIN_UNLOCK_TIMER, remainingTime);
+    }
+
+    lastStatusUpdate = millis();
+  }
+}
+//for access logins
+struct AccessLog {
+  String eventTime;
+  String eventType;
+  String userInfo;
+  bool wasSuccessful;
+};
+
+// Queue for storing recent access logs
+const int MAX_LOGS = 10;
+AccessLog accessLogs[MAX_LOGS];
+int logIndex = 0;
+
+// Function to add an entry to access logs
+void logAccessEvent(String eventType, String userInfo, bool wasSuccessful) {
+  // Get current time from NTP
+  struct tm timeinfo;
+  String timeStamp;
+
+  if (getLocalTime(&timeinfo)) {
+    char timeBuffer[30];
+    strftime(timeBuffer, sizeof(timeBuffer), "%Y-%m-%d %H:%M:%S", &timeinfo);
+    timeStamp = String(timeBuffer);
+  } else {
+    // Fallback to millis() if NTP fails
+    unsigned long currentMillis = millis();
+    unsigned long seconds = currentMillis / 1000;
+    unsigned long minutes = seconds / 60;
+    unsigned long hours = minutes / 60;
+
+    seconds %= 60;
+    minutes %= 60;
+    hours %= 24;
+
+    timeStamp = (hours < 10 ? "0" : "") + String(hours) + ":" +
+                (minutes < 10 ? "0" : "") + String(minutes) + ":" +
+                (seconds < 10 ? "0" : "") + String(seconds);
+  }
+
+  // Create log entry
+  accessLogs[logIndex] = {
+    timeStamp,
+    eventType,
+    userInfo,
+    wasSuccessful
+  };
+
+  // Update index for circular buffer
+  logIndex = (logIndex + 1) % MAX_LOGS;
+
+  // Send to Blynk
+  String logEntry = timeStamp + " - " + eventType + " - " + userInfo +
+                    " - " + (wasSuccessful ? "Success" : "Failed");
+  Blynk.virtualWrite(VPIN_ACCESS_LOG, logEntry);
+
+  // If access was denied, send notification
+  if (!wasSuccessful) {
+    Blynk.logEvent("Access Denied: " + eventType + " - " + userInfo + " - " + timeStamp);
+  }
+
+  Serial.println("Log: " + logEntry);
+}
+
+
+// Updated handler for remote lock/unlock button
+BLYNK_WRITE(VPIN_REMOTE_UNLOCK) {
+  int value = param.asInt();
+  if (value == 1) {
+    if (currentState == STATE_LOCKED) {
+      // Unlock the door
+      Serial.println("Remote unlock requested via Blynk");
+      displayMessage("Remote unlock\nrequested");
+
+      // Log the remote unlock event
+      logAccessEvent("Remote Unlock", "Smartphone App", true);
+
+      unlockDoor();
+    } else {
+      // Lock the door
+      Serial.println("Remote lock requested via Blynk");
+      displayMessage("Remote lock\nrequested");
+
+      // Log the remote lock event
+      logAccessEvent("Remote Lock", "Smartphone App", true);
+
+      lockDoor();
+    }
+    // Reset button state in app after action
+    Blynk.virtualWrite(VPIN_REMOTE_UNLOCK, 0);
+  }
+}
+
+// Handle PIN change requests from Blynk app
+// Handle PIN change requests from Blynk app (improved version)
+BLYNK_WRITE(VPIN_CHANGE_PIN) {
+  String newPIN = param.asStr();
+
+  // Clear any whitespace
+  newPIN.trim();
+
+  // Basic validation - ensure PIN is numeric and reasonable length
+  bool validPIN = true;
+  if (newPIN.length() < 4 || newPIN.length() > 8) {
+    validPIN = false;
+  }
+
+  for (unsigned int i = 0; i < newPIN.length(); i++) {
+    if (!isdigit(newPIN[i])) {
+      validPIN = false;
+      break;
+    }
+  }
+
+  if (validPIN) {
+    // Store the new PIN (consider using preferences library for persistence)
+    correctPIN = newPIN;
+
+    // Log the event
+    logAccessEvent("PIN Changed", "Via Smartphone", true);
+
+    // Send notification
+    Blynk.logEvent(EVENT_PIN_CHANGED, "Security PIN was changed successfully");
+
+    // Send confirmation to app
+    Blynk.virtualWrite(VPIN_CHANGE_PIN, "PIN changed successfully");
+
+    Serial.println("PIN changed via Blynk app to: " + newPIN);
+  } else {
+    // Send error notification
+    Blynk.logEvent(EVENT_PIN_CHANGED, "Invalid PIN format. Must be 4-8 digits");
+
+    // Send error to app
+    Blynk.virtualWrite(VPIN_CHANGE_PIN, "Error: PIN must be 4-8 digits");
+
+    Serial.println("Invalid PIN change attempt via Blynk app");
+  }
+}
+
+// Function to sync all info to Blynk when connected
+BLYNK_CONNECTED() {
+  // Send current door state
+  String statusMsg = (currentState == STATE_UNLOCKED) ? "UNLOCKED" :
+                     (currentState == STATE_LOCKED) ? "LOCKED" :
+                     (currentState == STATE_ENROLLING) ? "ENROLLING" : "LEARNING CARD";
+
+  Blynk.virtualWrite(VPIN_DOOR_STATUS, statusMsg);
+
+  // If unlocked, send remaining time
+  if (currentState == STATE_UNLOCKED) {
+    unsigned long elapsedTime = millis() - doorUnlockTime;
+    int remainingTime = (elapsedTime < DOOR_UNLOCK_DURATION) ?
+                        ((DOOR_UNLOCK_DURATION - elapsedTime) / 1000) : 0;
+    Blynk.virtualWrite(VPIN_UNLOCK_TIMER, remainingTime);
+  }
+
+  // Send recent access logs
+  for (int i = 0; i < MAX_LOGS; i++) {
+    int idx = (logIndex - 1 - i + MAX_LOGS) % MAX_LOGS;
+
+    // Skip empty log entries
+    if (accessLogs[idx].eventTime.length() == 0) continue;
+
+    String logEntry = accessLogs[idx].eventTime + " - " +
+                      accessLogs[idx].eventType + " - " +
+                      accessLogs[idx].userInfo + " - " +
+                      (accessLogs[idx].wasSuccessful ? "Success" : "Failed");
+
+    Blynk.virtualWrite(VPIN_ACCESS_LOG, logEntry);
+    delay(100); // Small delay to prevent flooding
+  }
+}
+
+
+// Function to trigger alarm and notify smartphone
+void triggerAlarm(String reason) {
+  // Sound the alarm
+  alarmBeep(3000);  // 3 seconds of alarm
+
+  // Log the event
+  logAccessEvent("ALARM", reason, false);
+
+  // Send high-priority notification to smartphone
+  Blynk.logEvent("security_alert", "🚨 SECURITY ALERT: " + reason);
+
+  // Make sure we turn on alarm indicator in the app
+  Blynk.virtualWrite(VPIN_ALARM_NOTIFY, 1); // Turn on alarm indicator
+
+  // Display alarm on screen
+  display.clearDisplay();
+  display.setTextSize(2);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(15, 5);
+  display.println("ALARM!");
+  display.setTextSize(1);
+  display.setCursor(0, 25);
+  display.println(reason);
+  display.display();
+}
+
+// Function to reset alarm
+void resetAlarm() {
+  // Turn off alarm indicator in app
+  Blynk.virtualWrite(VPIN_ALARM_NOTIFY, 0);
+
+  // Return to normal display
+  showMainScreen();
+}
+
+// Add a BLYNK_WRITE handler to let the app reset the alarm
+BLYNK_WRITE(VPIN_RESET_ALARM) {
+  if (param.asInt() == 1) {
+    resetAlarm();
+    // Reset the button state
+    Blynk.virtualWrite(VPIN_ALARM_NOTIFY, 0);
+    // Log the reset
+    logAccessEvent("Alarm Reset", "Via Smartphone", true);
+  }
+}
+
+void learnNewCard() {
+  currentState = STATE_LEARNING_CARD;
+
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 0);
+  display.println("CARD LEARNING MODE");
+  display.drawLine(0, 10, SCREEN_WIDTH, 10, SSD1306_WHITE);
+  display.setCursor(0, 15);
+  display.println("Place your card on");
+  display.println("the reader");
+
+  // Draw card icon
+  display.drawRect(90, 20, 30, 20, SSD1306_WHITE);
+  display.drawLine(90, 30, 120, 30, SSD1306_WHITE);
+
+  display.drawLine(0, 53, SCREEN_WIDTH, 53, SSD1306_WHITE);
+  display.setCursor(0, 55);
+  display.print("* Cancel");
+
+  display.display();
+
+  doubleBeep();
+  Serial.println("Entered card learning mode");
+
+  unsigned long startTime = millis();
+  unsigned long lastUpdateTime = 0;
+  int animationState = 0;
+
+  while (millis() - startTime < 30000) { // 30 second timeout
+    // Check for keypad cancel
+    char key = keypad.getKey();
+    if (key == '*') {
+      displayMessage("Card learning\ncancelled");
+      shortBeep();
+      delay(1500);
+      currentState = STATE_UNLOCKED;
+      showMainScreen();
+      return;
+    }
+
+    // Update animation every 500ms
+    if (millis() - lastUpdateTime > 500) {
+      display.fillRect(0, 40, SCREEN_WIDTH, 10, SSD1306_BLACK); // Clear animation area
+      display.setCursor(5, 40);
+
+      // Show waiting animation
+      String waitingText = "Waiting";
+      for (int i = 0; i < (animationState % 4); i++) {
+        waitingText += ".";
+      }
+      display.println(waitingText);
+
+      // Show elapsed time
+      display.setCursor(90, 40);
+      display.print((millis() - startTime) / 1000);
+      display.print("s");
+
+      display.display();
+
+      animationState++;
+      lastUpdateTime = millis();
+    }
+
+    // Try to read a card with RC522
+    String cardID = readRFIDCard();
+
+    if (cardID.length() >= 4) {
+      // Check if card is already authorized
+      bool alreadyAuthorized = false;
+      for (int i = 0; i < numAuthorizedCards; i++) {
+        if (cardID == authorizedCards[i]) {
+          alreadyAuthorized = true;
+          break;
+        }
+      }
+
+      if (alreadyAuthorized) {
+        display.clearDisplay();
+        display.setTextSize(1);
+        display.setCursor(0, 0);
+        display.println("CARD ALREADY KNOWN");
+        display.drawLine(0, 10, SCREEN_WIDTH, 10, SSD1306_WHITE);
+
+        displayCenteredText("This card is already", 25);
+        displayCenteredText("in the system", 35);
+        displayCenteredText("ID: " + cardID, 45);
+
+        display.display();
+
+        warningBeep();
+        delay(2000);
+      } else {
+        // Check if we have space for a new card
+        if (numAuthorizedCards >= MAX_CARDS) {
+          display.clearDisplay();
+          display.setTextSize(1);
+          display.setCursor(0, 0);
+          display.println("ERROR: STORAGE FULL");
+          display.drawLine(0, 10, SCREEN_WIDTH, 10, SSD1306_WHITE);
+
+          displayCenteredText("Maximum number of", 25);
+          displayCenteredText("cards reached", 35);
+
+          display.display();
+
+          errorBeep();
+          delay(2000);
+          currentState = STATE_UNLOCKED;
+          showMainScreen();
+          return;
+        }
+
+        // Save the new card permanently
+        saveNewCard(cardID);
+
+        // Success animation
+        display.clearDisplay();
+        display.setTextSize(1);
+        display.setCursor(0, 0);
+        display.println("NEW CARD LEARNED!");
+        display.drawLine(0, 10, SCREEN_WIDTH, 10, SSD1306_WHITE);
+
+        displayCenteredText("Card ID:", 20);
+
+        // Display card ID in a box
+        display.drawRect(20, 25, SCREEN_WIDTH - 40, 15, SSD1306_WHITE);
+        displayCenteredText(cardID, 32);
+
+        displayCenteredText("Card saved successfully", 45);
+
+        display.display();
+
+        successBeep();
+        Serial.println("New card added: " + cardID);
+        delay(3000);
+      }
+
+      currentState = STATE_UNLOCKED;
+      showMainScreen();
+      return;
+    }
+
+    delay(100);
+  }
+
+  // Timeout
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setCursor(0, 0);
+  display.println("TIMEOUT");
+  display.drawLine(0, 10, SCREEN_WIDTH, 10, SSD1306_WHITE);
+
+  displayCenteredText("No card detected", 25);
+  displayCenteredText("Please try again", 35);
+
+  display.display();
+
+  errorBeep();
+  delay(1500);
+  currentState = STATE_UNLOCKED;
+  showMainScreen();
+}
+
+
+bool checkRFIDAuthorized(String cardID) {
+  if (cardID.length() < 4) return false;  // Invalid ID
+
+  lastRFIDRead = cardID; // Store the last card ID for logging
+
+  // Convert to uppercase for comparison
+  cardID.toUpperCase();
+
+  // Check against authorized cards
+  for (int i = 0; i < numAuthorizedCards; i++) {
+    if (cardID.equals(authorizedCards[i])) {
+      logAccessEvent("RFID Access", "Card: " + cardID, true);
+      return true;
+    }
+  }
+
+  logAccessEvent("RFID Access", "Card: " + cardID, false);
+  return false;
+}
+
+// Add to your checkRFID() function
+void checkRFID() {
+  if (!rfidSensorAvailable) return;
+
+  String cardID = readRFIDCard();
+
+  if (cardID.length() > 0) {
+    Serial.println("RFID Card ID detected: " + cardID);
+    shortBeep();  // Gentle beep when card is detected
+
+    // Show animated processing
+    showProcessing("Reading RFID Card", 1000);
+
+    if (checkRFIDAuthorized(cardID)) {
+      display.clearDisplay();
+      display.setTextSize(1);
+      display.setTextColor(SSD1306_WHITE);
+
+      // Draw card icon
+      display.drawRect(54, 12, 20, 15, SSD1306_WHITE);
+      display.drawLine(54, 18, 74, 18, SSD1306_WHITE);
+
+      displayCenteredText("Card Authorized", 35);
+
+      display.display();
+
+      successBeep();
+      delay(1000);
+      unlockDoor();
+    } else {
+      display.clearDisplay();
+      display.setTextSize(1);
+      display.setTextColor(SSD1306_WHITE);
+
+      // Draw X icon
+      display.drawLine(55, 15, 65, 25, SSD1306_WHITE);
+      display.drawLine(65, 15, 55, 25, SSD1306_WHITE);
+
+      displayCenteredText("Unauthorized Card", 35);
+      displayCenteredText("ID: " + cardID, 45);
+
+      display.display();
+
+      errorBeep();
+      delay(2000);
+      showMainScreen();
+    }
+  }
+}
+
+// DOOR LOCK FUNCTIONS
+void unlockDoor() {
+  logAccessEvent("Door Unlocked",
+                 (enteredPIN.length() > 0) ? "PIN Entry" :
+                 (lastRFIDRead.length() > 0) ? "RFID: " + lastRFIDRead : "Fingerprint",
+                 true);
+  // Smooth animation for door unlocking
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+
+  // Update Blynk immediately
+  Blynk.virtualWrite(VPIN_DOOR_STATUS, "UNLOCKED");
+
+  // Draw unlocking animation
+  for (int i = 0; i < 5; i++) {
+    display.clearDisplay();
+
+    // Lock icon that opens
+    int offset = i * 2;
+    display.drawRect(55, 15, 18, 15, SSD1306_WHITE);
+    display.drawRect(59 + offset, 15, 10 - (offset * 2), 3, SSD1306_WHITE);
+
+    displayCenteredText("ACCESS GRANTED", 35);
+    display.display();
+    delay(100);
+  }
+
+  // Activate the relay to unlock
+  digitalWrite(RELAY_PIN, HIGH);
+  currentState = STATE_UNLOCKED;
+  doorUnlockTime = millis();
+
+  // Final unlocked confirmation
+  display.clearDisplay();
+  displayCenteredText("DOOR UNLOCKED", 20);
+
+  // Draw unlocked icon
+  display.drawRect(55, 30, 18, 15, SSD1306_WHITE);
+  display.drawLine(59, 33, 69, 33, SSD1306_WHITE);
+
+  display.display();
+  successBeep();
+  delay(1500);
+
+  showMainScreen();
+}
+
+void lockDoor() {
+  logAccessEvent("Door Locked",
+                 (currentState == STATE_UNLOCKED) ? "Auto Lock" : "Manual Lock",
+                 true);
+  // Smooth animation for door locking
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+
+  // Update Blynk immediately
+  Blynk.virtualWrite(VPIN_DOOR_STATUS, "LOCKED");
+
+  // Draw locking animation
+  for (int i = 0; i < 5; i++) {
+    display.clearDisplay();
+
+    // Lock icon that closes
+    int offset = (4 - i) * 2;
+    display.drawRect(55, 15, 18, 15, SSD1306_WHITE);
+    display.drawRect(59 + offset, 15, 10 - (offset * 2), 3, SSD1306_WHITE);
+
+    displayCenteredText("LOCKING...", 35);
+    display.display();
+    delay(100);
+  }
+
+  // Activate the relay to lock
+  digitalWrite(RELAY_PIN, LOW);
+  currentState = STATE_LOCKED;
+  enteredPIN = "";
+
+  // Final locked confirmation
+  display.clearDisplay();
+  displayCenteredText("DOOR LOCKED", 20);
+
+  // Draw locked icon
+  display.drawRect(55, 30, 18, 15, SSD1306_WHITE);
+  display.fillRect(59, 30, 10, 3, SSD1306_WHITE);
+
+  display.display();
+  shortBeep();
+  delay(1000);
+
+  showMainScreen();
+}
+
+// AUTHENTICATION FUNCTIONS
+void checkPIN() {
+  if (enteredPIN == correctPIN) {
+    logAccessEvent("PIN Access", "PIN: ****", true);
+    unlockDoor();
+  } else {
+    logAccessEvent("PIN Access", "PIN: ****", false);
+    displayMessage("ACCESS DENIED\n\nInvalid PIN");
+    errorBeep();
+    delay(2000);
+    enteredPIN = "";
+    showMainScreen();
+  }
+}
+
+//debug the keyboard
+// Add these functions to debug the keypad in the menu
+void debugKeypad() {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+
+  display.setCursor(0, 0);
+  display.println("KEYPAD DEBUG");
+  display.drawLine(0, 10, SCREEN_WIDTH, 10, SSD1306_WHITE);
+
+  display.setCursor(0, 20);
+  display.println("Press any key to test");
+  display.setCursor(0, 30);
+  display.print("Last key: ");
+
+  display.display();
+}
+
+// Add this to your loop function to debug keypad
+void debugKeypadInLoop() {
+  // Only for debugging the keypad
+  if (currentState == STATE_UNLOCKED) {
+    char key = keypad.getKey();
+    if (key) {
+      Serial.print("DEBUG - Unlocked state key: ");
+      Serial.println(key);
+
+      display.clearDisplay();
+      display.setTextSize(1);
+      display.setTextColor(SSD1306_WHITE);
+
+      display.setCursor(0, 0);
+      display.println("KEY DETECTED");
+      display.drawLine(0, 10, SCREEN_WIDTH, 10, SSD1306_WHITE);
+
+      display.setCursor(0, 20);
+      display.print("Key pressed: ");
+      display.println(key);
+
+      display.display();
+      delay(1000);
+      showMainScreen();
+    }
+  }
+}
+
+void checkFingerprint() {
+  uint8_t p = finger.getImage();
+
+  if (p != FINGERPRINT_OK) {
+    return; // No finger or error
+  }
+
+  shortBeep();  // Gentle feedback when finger detected
+
+  // Show animated processing
+  showProcessing("Fingerprint scan", 1500);
+
+  p = finger.image2Tz();
+  if (p != FINGERPRINT_OK) {
+    showError("Image conversion failed");
+    return;
+  }
+
+  p = finger.fingerFastSearch();
+  if (p == FINGERPRINT_OK) {
+    logAccessEvent("Fingerprint Access", "ID: " + String(finger.fingerID), true);
+    Serial.print("Fingerprint match found! ID #");
+    Serial.println(finger.fingerID);
+
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setTextColor(SSD1306_WHITE);
+
+    // Draw check mark icon
+    display.drawLine(50, 20, 55, 25, SSD1306_WHITE);
+    display.drawLine(55, 25, 65, 15, SSD1306_WHITE);
+
+    displayCenteredText("Fingerprint Match", 35);
+    displayCenteredText("ID: " + String(finger.fingerID), 45);
+
+    display.display();
+
+    successBeep();
+    delay(1000);
+    unlockDoor();
+  } else {
+    logAccessEvent("Fingerprint Access", "Unknown", false);
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setTextColor(SSD1306_WHITE);
+
+    // Draw X icon
+    display.drawLine(55, 15, 65, 25, SSD1306_WHITE);
+    display.drawLine(65, 15, 55, 25, SSD1306_WHITE);
+
+    displayCenteredText("No Match Found", 35);
+
+    display.display();
+
+    errorBeep();
+    delay(2000);
+    showMainScreen();
+  }
+}
+// FINGERPRINT ENROLLMENT
+
+void startEnrollment() {
+  if (!fingerprintSensorAvailable) {
+    showError("No fingerprint sensor");
+    return;
+  }
+
+  currentState = STATE_ENROLLING;
+  showMainScreen();
+  delay(1000);
+
+  // Find next available ID
+  int id = 1;
+  while (finger.loadModel(id) == FINGERPRINT_OK) {
+    id++;
+    if (id >= 127) {
+      showError("Fingerprint memory full");
+      currentState = STATE_UNLOCKED;
+      showMainScreen();
+      return;
+    }
+  }
+
+  Serial.print("Enrolling ID #");
+  Serial.println(id);
+
+  enrollFingerprint(id);
+}
+
+void enrollFingerprint(int id) {
+  uint8_t p = FINGERPRINT_NOFINGER;
+
+  // ----- First Scan -----
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setCursor(0, 0);
+  display.println("ENROLLMENT - STEP 1");
+  display.drawLine(0, 10, SCREEN_WIDTH, 10, SSD1306_WHITE);
+
+  displayCenteredText("Place finger on", 20);
+  displayCenteredText("the sensor", 30);
+
+  // Draw fingerprint icon
+  display.drawCircle(64, 45, 5, SSD1306_WHITE);
+  display.drawLine(64, 45, 64, 50, SSD1306_WHITE);
+
+  display.display();
+
+  unsigned long startTime = millis();
+  unsigned long lastUpdateTime = 0;
+  int animationState = 0;
+
+  while (true) {
+    p = finger.getImage();
+
+    // Check for cancel
+    char key = keypad.getKey();
+    if (key == '*') {
+      displayMessage("Enrollment cancelled");
+      shortBeep();
+      delay(1500);
+      currentState = STATE_UNLOCKED;
+      showMainScreen();
+      return;
+    }
+
+    // Update waiting animation
+    if (millis() - lastUpdateTime > 500) {
+      display.fillRect(0, 55, SCREEN_WIDTH, 10, SSD1306_BLACK);
+      display.setCursor(5, 55);
+
+      String waitingText = "Waiting";
+      for (int i = 0; i < (animationState % 4); i++) {
+        waitingText += ".";
+      }
+      display.println(waitingText);
+      display.display();
+
+      animationState++;
+      lastUpdateTime = millis();
+    }
+
+    if (p == FINGERPRINT_OK) {
+      break;
+    }
+
+    delay(100);
+  }
+
+  shortBeep();
+  showProcessing("Processing fingerprint", 1000);
+
+  p = finger.image2Tz(1);
+  if (p != FINGERPRINT_OK) {
+    showError("Processing failed");
+    currentState = STATE_UNLOCKED;
+    showMainScreen();
+    return;
+  }
+
+  // ----- Wait for finger removal -----
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setCursor(0, 0);
+  display.println("ENROLLMENT - STEP 2");
+  display.drawLine(0, 10, SCREEN_WIDTH, 10, SSD1306_WHITE);
+
+  displayCenteredText("Remove finger", 25);
+  displayCenteredText("from sensor", 35);
+
+  display.display();
+
+  doubleBeep();
+  delay(1000);
+
+  p = FINGERPRINT_NOFINGER;
+  while (p != FINGERPRINT_NOFINGER) {
+    p = finger.getImage();
+    delay(100);
+  }
+
+  // ----- Second Scan -----
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setCursor(0, 0);
+  display.println("ENROLLMENT - STEP 3");
+  display.drawLine(0, 10, SCREEN_WIDTH, 10, SSD1306_WHITE);
+
+  displayCenteredText("Place same finger", 20);
+  displayCenteredText("again", 30);
+
+  // Draw fingerprint icon
+  display.drawCircle(64, 45, 5, SSD1306_WHITE);
+  display.drawLine(64, 45, 64, 50, SSD1306_WHITE);
+
+  display.display();
+
+  startTime = millis();
+  lastUpdateTime = 0;
+  animationState = 0;
+
+  while (true) {
+    p = finger.getImage();
+
+    // Check for cancel
+    char key = keypad.getKey();
+    if (key == '*') {
+      displayMessage("Enrollment cancelled");
+      shortBeep();
+      delay(1500);
+      currentState = STATE_UNLOCKED;
+      showMainScreen();
+      return;
+    }
+
+    // Update waiting animation
+    if (millis() - lastUpdateTime > 500) {
+      display.fillRect(0, 55, SCREEN_WIDTH, 10, SSD1306_BLACK);
+      display.setCursor(5, 55);
+
+      String waitingText = "Waiting";
+      for (int i = 0; i < (animationState % 4); i++) {
+        waitingText += ".";
+      }
+      display.println(waitingText);
+      display.display();
+
+      animationState++;
+      lastUpdateTime = millis();
+    }
+
+    if (p == FINGERPRINT_OK) {
+      break;
+    }
+
+    delay(100);
+  }
+
+  shortBeep();
+  showProcessing("Processing fingerprint", 1000);
+
+  p = finger.image2Tz(2);
+  if (p != FINGERPRINT_OK) {
+    showError("Processing failed");
+    currentState = STATE_UNLOCKED;
+    showMainScreen();
+    return;
+  }
+
+  // ----- Create Model -----
+  showProgress("Creating fingerprint model", 1500);
+
+  p = finger.createModel();
+  if (p != FINGERPRINT_OK) {
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setCursor(0, 0);
+    display.println("ENROLLMENT ERROR");
+    display.drawLine(0, 10, SCREEN_WIDTH, 10, SSD1306_WHITE);
+
+    displayCenteredText("Fingerprints", 20);
+    displayCenteredText("did not match", 30);
+    displayCenteredText("Please try again", 40);
+
+    display.display();
+
+    errorBeep();
+    delay(2000);
+    currentState = STATE_UNLOCKED;
+    showMainScreen();
+    return;
+  }
+
+  // ----- Store Model -----
+  showProgress("Saving fingerprint", 1000);
+
+  p = finger.storeModel(id);
+  if (p != FINGERPRINT_OK) {
+    showError("Failed to save");
+    currentState = STATE_UNLOCKED;
+    showMainScreen();
+    return;
+  }
+
+  // Success!
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setCursor(0, 0);
+  display.println("ENROLLMENT SUCCESS");
+  display.drawLine(0, 10, SCREEN_WIDTH, 10, SSD1306_WHITE);
+
+  // Draw check mark
+  display.drawLine(55, 25, 60, 30, SSD1306_WHITE);
+  display.drawLine(60, 30, 70, 20, SSD1306_WHITE);
+
+  displayCenteredText("Fingerprint saved", 40);
+  displayCenteredText("as ID #" + String(id), 50);
+
+  display.display();
+
+  successBeep();
+  delay(3000);
+
+  currentState = STATE_UNLOCKED;
+  showMainScreen();
+}
+
+// Handle PIN management screen
+void showPINManagement() {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+
+  // Header
+  display.setCursor(0, 0);
+  display.println("Change PIN");
+  display.drawLine(0, 10, SCREEN_WIDTH, 10, SSD1306_WHITE);
+
+  if (enteringNewPIN) {
+    displayCenteredText("Enter New PIN:", 15);
+
+    // Draw PIN entry box
+    display.drawRect(25, 25, 80, 15, SSD1306_WHITE);
+    display.setCursor(30, 29);
+
+    // Show masked PIN
+    for (unsigned int i = 0; i < newPIN.length(); i++) {
+      display.print("*");
+      display.print(" ");
+    }
+  } else {
+    displayCenteredText("Confirm New PIN:", 15);
+
+    // Draw PIN entry box
+    display.drawRect(25, 25, 80, 15, SSD1306_WHITE);
+    display.setCursor(30, 29);
+
+    // Show masked PIN
+    for (unsigned int i = 0; i < confirmPIN.length(); i++) {
+      display.print("*");
+      display.print(" ");
+    }
+  }
+
+  // Draw keypad hint at bottom
+  display.drawLine(0, 45, SCREEN_WIDTH, 45, SSD1306_WHITE);
+  display.setCursor(0, 48);
+  display.print("* Cancel");
+  display.setCursor(64, 48);
+  display.print("# Submit");
+
+  display.display();
+}
+
+void processPINManagementKey(char key) {
+  if (key >= '0' && key <= '9') {
+    // Add digit to appropriate PIN
+    if (enteringNewPIN) {
+      if (newPIN.length() < 8) { // Limit PIN length
+        newPIN += key;
+      }
+    } else {
+      if (confirmPIN.length() < 8) {
+        confirmPIN += key;
+      }
+    }
+    showPINManagement();
+  } else if (key == '#') {
+    // Submit current PIN
+    if (enteringNewPIN) {
+      // Validate new PIN
+      if (newPIN.length() < 4) {
+        displayMessage("PIN too short\nMinimum 4 digits", true);
+        delay(2000);
+        showPINManagement();
+      } else {
+        // Move to confirmation
+        enteringNewPIN = false;
+        showPINManagement();
+      }
+    } else {
+      // Confirm PIN
+      if (newPIN == confirmPIN) {
+        // PINs match, save the new PIN
+        correctPIN = newPIN;
+
+        // Log the PIN change event
+        logAccessEvent("PIN Changed", "Local Panel", true);
+
+        // Display success
+        display.clearDisplay();
+        display.setTextSize(1);
+        display.setCursor(0, 0);
+        display.println("PIN CHANGED");
+        display.drawLine(0, 10, SCREEN_WIDTH, 10, SSD1306_WHITE);
+
+        // Draw check mark
+        display.drawLine(55, 25, 60, 30, SSD1306_WHITE);
+        display.drawLine(60, 30, 70, 20, SSD1306_WHITE);
+
+        displayCenteredText("New PIN saved", 40);
+
+        display.display();
+
+        successBeep();
+        delay(2000);
+
+        // Send notification to app
+        Blynk.logEvent(EVENT_PIN_CHANGED, "PIN was changed successfully");
+
+        // Return to unlocked state
+        currentState = STATE_UNLOCKED;
+        showMainScreen();
+      } else {
+        // PINs don't match
+        display.clearDisplay();
+        display.setTextSize(1);
+        display.setCursor(0, 0);
+        display.println("PIN MISMATCH");
+        display.drawLine(0, 10, SCREEN_WIDTH, 10, SSD1306_WHITE);
+
+        // Draw X mark
+        display.drawLine(55, 25, 65, 35, SSD1306_WHITE);
+        display.drawLine(65, 25, 55, 35, SSD1306_WHITE);
+
+        displayCenteredText("PINs don't match", 40);
+
+        display.display();
+
+        errorBeep();
+        delay(2000);
+
+        // Start over
+        enteringNewPIN = true;
+        newPIN = "";
+        confirmPIN = "";
+        showPINManagement();
+      }
+    }
+  }
+}
+
+// Function to start PIN change process
+void startPINChange() {
+  currentState = STATE_PIN_MANAGEMENT;
+  enteringNewPIN = true;
+  newPIN = "";
+  confirmPIN = "";
+  showPINManagement();
+}
+
+// KEY HANDLING
+void processUnlockedStateKey(char key) {
+  switch (key) {
+    case '1':
+      // Start PIN change process
+      Serial.println("A key pressed - Starting PIN change");
+      startPINChange();
+      break;
+
+    case '4':
+      // Start fingerprint enrollment
+      if (fingerprintSensorAvailable) {
+        startEnrollment();
+      } else {
+        showError("Fingerprint not available");
+      }
+      break;
+
+    case '7':
+      // Start card learning
+      Serial.println("C key pressed - Starting card learning mode");
+      if (rfidSensorAvailable) {
+        learnNewCard();
+      } else {
+        showError("RFID not available");
+      }
+      break;
+
+    case '*':
+      // Lock door immediately
+      Serial.println("D key pressed - Locking door");
+      displayMessage("Locking door...");
+      delay(1000);
+      lockDoor();
+      break;
+
+    default:
+      // Print for debugging
+      Serial.print("Unrecognized key pressed in unlocked state: ");
+      Serial.println(key);
+      break;
+  }
+}
+
+void processLockedStateKey(char key) {
+  switch (key) {
+    case '#':
+      // Submit PIN
+      checkPIN();
+      break;
+
+    case 'A':
+      // Fingerprint mode prompt
+      if (fingerprintSensorAvailable) {
+        displayMessage("Place finger on\nsensor");
+        delay(1000);
+        showMainScreen();
+      } else {
+        showError("Fingerprint not available");
+      }
+      break;
+
+    case 'B':
+      // Help
+      displayMessage("HELP:\n1. Enter PIN, use finger\n   or RFID card\n2. * to clear PIN\n3. # to submit PIN\n4. A for fingerprint\n5. B for help");
+      delay(5000);
+      showMainScreen();
+      break;
+
+    default:
+      // Add to PIN if it's a number
+      if (key >= '0' && key <= '9') {
+        enteredPIN += key;
+        showPINEntry();
+
+        // Auto-submit if PIN is complete
+        if (enteredPIN.length() >= correctPIN.length()) {
+          delay(500);
+          checkPIN();
+        }
+      }
+      break;
+  }
+}
+
+void processKey(char key) {
+  Serial.print("Key pressed: ");
+  Serial.print(key);
+  Serial.print(" (ASCII: ");
+  Serial.print((int)key);
+  Serial.println(")");
+
+  shortBeep();
+
+  // Global key handlers
+  if (key == '*') {
+    switch (currentState) {
+      case STATE_LOCKED:
+        if (enteredPIN.length() > 0) {
+          // Clear PIN in locked state
+          enteredPIN = "";
+          showPINEntry();
+          displayMessage("PIN entry cancelled", true);
+          delay(1000);
+          showMainScreen();
+        }
+        break;
+
+      case STATE_UNLOCKED:
+        // Lock door immediately when * is pressed in unlocked state
+        Serial.println("* key pressed - Locking door in unlocked state");
+        displayMessage("Locking door...");
+        delay(1000);
+        lockDoor();
+        return; // Exit function after locking
+        break;
+
+      case STATE_ENROLLING:
+        // Cancel enrollment process
+        displayMessage("Fingerprint enrollment\ncancelled", true);
+        shortBeep();
+        delay(1500);
+        currentState = STATE_UNLOCKED;
+        showMainScreen();
+        break;
+
+      case STATE_LEARNING_CARD:
+        // Cancel card learning
+        displayMessage("Card learning\ncancelled", true);
+        shortBeep();
+        delay(1500);
+        currentState = STATE_UNLOCKED;
+        showMainScreen();
+        break;
+
+      case STATE_PIN_MANAGEMENT:
+        // Cancel PIN changing
+        displayMessage("PIN change\ncancelled", true);
+        shortBeep();
+        delay(1500);
+        currentState = STATE_UNLOCKED;
+        showMainScreen();
+        break;
+    }
+    return; // Exit function after handling cancel
+  }
+
+  switch (currentState) {
+    case STATE_LOCKED:
+      processLockedStateKey(key);
+      break;
+
+    case STATE_UNLOCKED:
+      processUnlockedStateKey(key);
+      break;
+
+    case STATE_ENROLLING:
+      // Keys for enrollment are handled in the enrollment function
+      break;
+
+    case STATE_LEARNING_CARD:
+      // Keys for card learning are handled in the learnNewCard function
+      break;
+
+    case STATE_PIN_MANAGEMENT:
+      processPINManagementKey(key);
+      break;
+  }
+}
+
+// SYSTEM FUNCTIONS
+
+void checkDoorTimeout() {
+  if (currentState == STATE_UNLOCKED) {
+    // Calculate remaining time correctly
+    unsigned long currentTime = millis();
+    unsigned long elapsedTime = currentTime - doorUnlockTime;
+
+    if (elapsedTime >= DOOR_UNLOCK_DURATION) {
+      // Time to lock the door
+      displayMessage("Auto-locking door...");
+      doubleBeep();
+      delay(1000);
+      lockDoor();
+    } else {
+      // Update the countdown on screen
+      int remainingSeconds = (DOOR_UNLOCK_DURATION - elapsedTime) / 1000;
+
+      // Update Blynk timer every second
+      static int lastRemainingSeconds = -1;
+      if (remainingSeconds != lastRemainingSeconds) {
+        Blynk.virtualWrite(VPIN_UNLOCK_TIMER, remainingSeconds);
+        lastRemainingSeconds = remainingSeconds;
+
+        // Refresh the main screen to show updated countdown
+        showMainScreen();
+      }
+    }
+  }
+}
+
+
+void setup() {
+  Serial.begin(115200);
+  Serial.println("Starting Smart Door Lock System...");
+
+  for (byte r = 0; r < ROWS; r++) {
+    pinMode(rowPins[r], INPUT_PULLUP);
+  }
+
+  initializeCardStorage();
+
+  // Set up the display first for better debugging visibility
+  Wire.begin();
+  Serial.println("Wire initialized");
+
+  if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDRESS)) {
+    Serial.println("SSD1306 allocation failed");
+    while (true);
+  }
+  Serial.println("Display initialized");
+  displayMessage("System starting...");
+
+  // Initialize buzzer and relay first
+  pinMode(BUZZER_PIN, OUTPUT);
+  digitalWrite(BUZZER_PIN, LOW);
+  pinMode(RELAY_PIN, OUTPUT);
+  digitalWrite(RELAY_PIN, LOW);
+  Serial.println("Buzzer and relay initialized");
+
+  // Connect to WiFi first before trying NTP
+  displayMessage("Connecting to WiFi...");
+  Serial.print("Connecting to WiFi: ");
+  Serial.println(ssid);
+
+  WiFi.begin(ssid, pass);
+
+  // Wait for WiFi with timeout
+  int wifiTimeout = 0;
+  while (WiFi.status() != WL_CONNECTED && wifiTimeout < 20) {
+    delay(500);
+    Serial.print(".");
+    wifiTimeout++;
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\nWiFi connected");
+    displayMessage("WiFi connected\nIP: " + WiFi.localIP().toString());
+    delay(1000);
+
+    // Now try NTP
+    initNTP();
+  } else {
+    Serial.println("\nWiFi connection failed");
+    displayMessage("WiFi failed\nOperating offline");
+    delay(2000);
+  }
+
+  // Initialize RFID Reader with improved error handling
+  displayMessage("Checking RFID...");
+  Serial.println("Initializing RFID reader...");
+
+  SPI.begin();
+  delay(100); // Add delay after SPI.begin()
+
+  // Multiple attempts to initialize RFID
+  bool rfidInitialized = false;
+  for (int attempt = 0; attempt < 3; attempt++) {
+    rfid.PCD_Init(RFID_SS_PIN, RFID_RST_PIN);
+    delay(50);
+
+    // Test if RFID initialized properly
+    byte version = rfid.PCD_ReadRegister(rfid.VersionReg);
+    if (version == 0x00 || version == 0xFF) {
+      Serial.println("RFID initialization failed. Retrying...");
+      delay(200);
+    } else {
+      Serial.print("RFID version: 0x");
+      Serial.println(version, HEX);
+      rfidInitialized = true;
+      rfidSensorAvailable = true;
+      break;
+    }
+  }
+
+  if (rfidInitialized) {
+    Serial.println("RFID reader detected!");
+    displayMessage("RFID reader\ndetected");
+  } else {
+    Serial.println("RFID reader not found or not working");
+    displayMessage("No RFID reader\nPIN/Fingerprint only");
+    rfidSensorAvailable = false;
+  }
+  delay(1500);
+
+  // Initialize Fingerprint Sensor
+  fingerSerial.begin(57600, SERIAL_8N1, FINGERPRINT_RX, FINGERPRINT_TX);
+  delay(100);
+
+  if (finger.verifyPassword()) {
+    Serial.println("Fingerprint sensor found!");
+    displayMessage("Fingerprint sensor\ndetected");
+    fingerprintSensorAvailable = true;
+  } else {
+    Serial.println("Fingerprint sensor not found");
+    displayMessage("No fingerprint sensor\nPIN mode only");
+    fingerprintSensorAvailable = false;
+  }
+  delay(1500);
+
+  // Connect to Blynk after all hardware is initialized
+  displayMessage("Connecting to Blynk...");
+  Serial.println("Connecting to Blynk...");
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Blynk.config(auth);
+
+    int blynkTimeout = 0;
+    while (!Blynk.connected() && blynkTimeout < 10) {
+      Blynk.connect();
+      delay(500);
+      blynkTimeout++;
+    }
+
+    if (Blynk.connected()) {
+      Serial.println("Blynk connected!");
+      displayMessage("Blynk connected!\nRemote access enabled");
+
+      // Send initial door state to the app
+      Blynk.virtualWrite(VPIN_DOOR_STATUS, (currentState == STATE_UNLOCKED) ? "Unlocked" : "Locked");
+    } else {
+      Serial.println("Blynk connection failed");
+      displayMessage("Blynk connection\nfailed. Local only");
+    }
+  } else {
+    Serial.println("Skipping Blynk - No WiFi");
+    displayMessage("No WiFi\nLocal access only");
+  }
+  delay(1500);
+
+  shortBeep();  // Initial beep to indicate system startup complete
+  Serial.println("System initialization complete");
+  showMainScreen();
+}
+
+unsigned long lastKeyTime = 0;
+bool keyProcessed = false;
+
+void loop() {
+  // Static variable to monitor uptime
+  static unsigned long lastStatusTime = 0;
+  static bool printedDebug = false;
+
+  // Add this debug section for keypad testing
+  static bool testKeypadMode = false;
+
+  // Toggle test mode with Serial command
+  if (Serial.available()) {
+    String cmd = Serial.readStringUntil('\n');
+    if (cmd == "testpad") {
+      testKeypadMode = !testKeypadMode;
+      Serial.print("Keypad test mode: ");
+      Serial.println(testKeypadMode ? "ON" : "OFF");
+      if (testKeypadMode) {
+        debugKeypad();
+      } else {
+        showMainScreen();
+      }
+    }
+  }
+
+  // Simple key detection test that bypasses all state handling
+  if (testKeypadMode) {
+    char key = keypad.getKey();
+    if (key) {
+      Serial.print("TEST - Raw key detected: ");
+      Serial.println(key);
+
+      display.setCursor(60, 30);
+      display.print(key);
+      display.display();
+
+      // Beep to confirm key press
+      digitalWrite(BUZZER_PIN, HIGH);
+      delay(50);
+      digitalWrite(BUZZER_PIN, LOW);
+    }
+  } else {
+    // Your normal keypad handling code
+    char key = keypad.getKey();
+    if (key) {
+      processKey(key);
+    }
+  }
+
+  // Handle Blynk connection if WiFi is available
+  if (WiFi.status() == WL_CONNECTED) {
+    Blynk.run();
+  } else {
+    // Attempt to reconnect WiFi periodically
+    static unsigned long lastWiFiAttempt = 0;
+    if (millis() - lastWiFiAttempt > 60000) { // Try every minute
+      lastWiFiAttempt = millis();
+      if (WiFi.status() != WL_CONNECTED) {
+        Serial.println("Attempting to reconnect WiFi...");
+        WiFi.begin(ssid, pass);
+      }
+    }
+  }
+
+  // Check for key presses
+  char key = keypad.getKey();
+  if (key) {
+    if (!keyProcessed && (millis() - lastKeyTime > 300)) {
+      Serial.print("Key pressed: ");
+      Serial.print(key);
+      Serial.print(" (ASCII: ");
+      Serial.print((int)key);
+      Serial.println(")");
+
+      lastKeyTime = millis();
+      keyProcessed = true;
+      processKey(key);
+    }
+  } else {
+    keyProcessed = false;
+  }
+  // Debug output to see if pins are changing
+  static unsigned long lastDebugTime = 0;
+  if (millis() - lastDebugTime > 1000) {
+    lastDebugTime = millis();
+    Serial.print("Row pins: ");
+    for (byte r = 0; r < ROWS; r++) {
+      Serial.print(digitalRead(rowPins[r]));
+      Serial.print(" ");
+    }
+    Serial.print("| Col pins: ");
+    for (byte c = 0; c < COLS; c++) {
+      Serial.print(digitalRead(colPins[c]));
+      Serial.print(" ");
+    }
+    Serial.println();
+  }
+
+  // Check if we need to lock the door
+  checkDoorTimeout();
+
+  // Check fingerprint sensor if available and in locked state
+  if (fingerprintSensorAvailable && currentState == STATE_LOCKED) {
+    checkFingerprint();
+  }
+
+  // Check RFID reader if available and in locked state
+  if (rfidSensorAvailable && currentState == STATE_LOCKED) {
+    checkRFID();
+  }
+
+  // Print status periodically to confirm code is running
+  if (millis() - lastStatusTime > 10000) { // Every 10 seconds
+    lastStatusTime = millis();
+    Serial.print("System running. State: ");
+    switch (currentState) {
+      case STATE_LOCKED: Serial.println("LOCKED"); break;
+      case STATE_UNLOCKED: Serial.println("UNLOCKED"); break;
+      case STATE_ENROLLING: Serial.println("ENROLLING"); break;
+      case STATE_LEARNING_CARD: Serial.println("LEARNING_CARD"); break;
+      case STATE_PIN_MANAGEMENT: Serial.println("PIN_MANAGEMENT"); break;
+    }
+
+    // Also check if RFID reader is still responding
+    if (rfidSensorAvailable) {
+      byte version = rfid.PCD_ReadRegister(rfid.VersionReg);
+      if (version == 0x00 || version == 0xFF) {
+        Serial.println("Warning: RFID reader may have disconnected");
+        // Try to reinitialize
+        rfid.PCD_Init(RFID_SS_PIN, RFID_RST_PIN);
+      }
+    }
+  }
+
+  // Small delay to prevent tight loop
+  delay(10);
+}
